@@ -251,6 +251,35 @@ class TestArgConverter:
             if out.startswith(prev):
                 prev = out
 
+    @pytest.mark.parametrize(
+        "raw,args",
+        [
+            # The array is closed with a brace.
+            (
+                '{"name":"f","args":{"a":[{"n":1},{"n":2}},"b":0}}',
+                '{"a":[{"n":1},{"n":2}},"b":0}',
+            ),
+            # The same, cut before the wrapper's brace.
+            ('{"name":"f","args":{"a":[{"n":1}},"b":0}', '{"a":[{"n":1}},"b":0}'),
+            # An unterminated string ends in a brace.
+            ('{"name":"f","args":{"a":[{"n":1}},"b":"x}', '{"a":[{"n":1}},"b":"x}'),
+            # Brackets in strings do not count.
+            ('{"name":"f","args":{"a":"[{"},"id":3}', '{"a":"[{"}'),
+            # Other errors: an extra brace, or a broken member after args.
+            ('{"name":"f","args":{"a":1}}}', '{"a":1}'),
+            ('{"name":"f","args":{"a":1,},"id":3}', '{"a":1,}'),
+            # Members after args, also when the wrapper is cut or broken there.
+            ('{"name":"f","args":{"a":1},"id":3}', '{"a":1}'),
+            ('{"name":"f","args":{"a":1},"id":3', '{"a":1}'),
+            ('{"name":"f","args":{"a":1},"id":bad}', '{"a":1}'),
+        ],
+    )
+    def test_misplaced_brace_keeps_the_rest(self, raw, args):
+        final = _inkling_arg_converter(raw, partial=False)
+        assert final == args
+        for end in range(len(raw)):
+            assert final.startswith(_inkling_arg_converter(raw[:end], partial=True))
+
     def test_args_value_appearing_in_name(self):
         raw = '{"name":"args","args":{"k":1}}'
         assert _inkling_arg_converter(raw, False) == '{"k":1}'
@@ -489,6 +518,15 @@ class TestStreaming:
         results = _stream(parser, mock_request, text, chunk_size)
         assert _collect_reasoning(results) == "thinking..."
         assert collect_content(results) == "answer"
+
+    @pytest.mark.parametrize("chunk_size", [1, 3, 64])
+    def test_misplaced_brace_is_not_truncated(
+        self, mock_tokenizer, mock_request, chunk_size
+    ):
+        args = '{"a":[{"n":1},{"n":2}},"b":0}'
+        text = _tool_block("f", args)
+        results = _stream(InklingParser(mock_tokenizer), mock_request, text, chunk_size)
+        assert collect_tool_arguments(results) == args
 
     def test_split_marker_held_across_chunks(self, parser, mock_request):
         # Mirrors Rust `inkling_streaming_holds_split_markers`.

@@ -29,6 +29,7 @@ import json
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
+import regex as re
 from xgrammar import StructuralTag
 from xgrammar.structural_tag import (
     AnyTextFormat,
@@ -49,7 +50,7 @@ from vllm.parser.engine.parser_engine_config import (
     ParserState,
     Transition,
 )
-from vllm.parser.utils import extract_json_member_object
+from vllm.parser.utils import find_json_member_object
 from vllm.renderers.inkling_encoding import (
     AUDIO_END,
     CONTENT_AUDIO_INPUT,
@@ -102,6 +103,9 @@ INKLING_CONTROL_TOKENS = (
 )
 
 
+_JSON_STRING = re.compile(r'"(?:[^"\\]|\\.)*"?', re.DOTALL)
+
+
 def _inkling_arg_converter(raw_args: str, partial: bool) -> str:
     """Carve the `args` object out of the tool-call JSON wrapper.
 
@@ -111,14 +115,33 @@ def _inkling_arg_converter(raw_args: str, partial: bool) -> str:
     converter, `_compute_arg_delta` streams the wrapper verbatim into
     the OpenAI `arguments` field (`converter is None -> raw delta`,
     unconditionally; `stream_arg_deltas=False` does not stop it).
-    `extract_json_member_object` returns a prefix-stable verbatim
+    `find_json_member_object` bounds a prefix-stable verbatim
     substring, which the engine's argument-delta diffing requires.
     """
-    span = extract_json_member_object(raw_args, "args")
-    if span is None:
+    bounds = find_json_member_object(raw_args, "args")
+    if bounds is None:
         # No args value yet (streaming) or none at all (treat as empty).
         return "" if partial else "{}"
-    return span
+    start, end = bounds
+    if not partial and end is not None:
+        end = _malformed_args_end(raw_args, start, end)
+    return raw_args[start:end]
+
+
+def _malformed_args_end(raw_args: str, start: int, end: int) -> int:
+    """Where the args of a complete call end. `end` is the brace that balances;
+    an array still open there was closed with a brace (`[{..}}` for `[{..}]`),
+    so the args run on to the end of the wrapper."""
+    span = _JSON_STRING.sub("", raw_args[start:end])
+    if span.count("[") <= span.count("]"):
+        return end
+    # A complete call has one more closing brace than opening ones, and its last
+    # brace is the wrapper's.
+    braces = _JSON_STRING.sub("", raw_args).rstrip()
+    wrapper_end = len(raw_args.rstrip())
+    if braces.endswith("}") and braces.count("}") > braces.count("{"):
+        wrapper_end = len(raw_args[: wrapper_end - 1].rstrip())
+    return max(end, wrapper_end)
 
 
 def _inkling_arg_value_extender(raw_args: str) -> ArgValueExtender | None:
@@ -130,9 +153,10 @@ def _inkling_arg_value_extender(raw_args: str) -> ArgValueExtender | None:
     re-running the converter. Returns None before the value starts, so the
     converter decides whether a string value may stream.
     """
-    span = extract_json_member_object(raw_args, "args")
-    if span is None:
+    bounds = find_json_member_object(raw_args, "args")
+    if bounds is None:
         return None
+    span = raw_args[bounds[0] : bounds[1]]
     depth = 0
     in_string = escape = in_value = False
     for ch in span:

@@ -111,6 +111,13 @@ def extract_json_member_object(raw: str, key: str) -> str | None:
     the previous one; the scanner is string/escape-aware so a matching literal
     inside another value cannot mislead it, and it recovers a partial span when
     the wrapper is truncated (where `json.loads` would fail)."""
+    bounds = find_json_member_object(raw, key)
+    return None if bounds is None else raw[bounds[0] : bounds[1]]
+
+
+def find_json_member_object(raw: str, key: str) -> tuple[int, int | None] | None:
+    """Start and end of the span `extract_json_member_object` returns; the end
+    is `None` while the object is unterminated."""
     depth = 0
     in_string = False
     escape = False
@@ -139,10 +146,7 @@ def extract_json_member_object(raw: str, key: str) -> str | None:
                 return None
             if raw[value_start] != "{":
                 raise ValueError(f"member {key!r} must be a JSON object")
-            value_end = scan_json_object_end(raw, value_start)
-            if value_end is None:
-                return raw[value_start:]
-            return raw[value_start:value_end]
+            return value_start, scan_json_object_end(raw, value_start)
         elif ch in "{[":
             depth += 1
         elif ch in "}]":
