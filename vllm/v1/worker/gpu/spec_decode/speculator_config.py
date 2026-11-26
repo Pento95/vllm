@@ -375,6 +375,16 @@ _CONFIG_BY_METHOD: dict[str, str] = {
 # Combined checkpoints need a model-specific transform before the draft's
 # architecture can be inspected. Keys use the target's text model type.
 _CONFIG_BY_TARGET_MODEL_TYPE: dict[str, dict[str, str]] = {
+    "dflash": {
+        # Inkling 2 Small's text config keeps the class's model type; Mini's
+        # checkpoint names its own.
+        "inkling2_model": (
+            "vllm.models.inkling2.speculator_config.Inkling2DFlash2SpeculatorConfig"
+        ),
+        "inkling2_loop_text": (
+            "vllm.models.inkling2.speculator_config.Inkling2DFlash2SpeculatorConfig"
+        ),
+    },
     "dfly": {
         "hy_v4": "vllm.models.hy_v4.dfly_config.HYV4DFlySpeculatorConfig",
         "hy_v4_flash": (
@@ -445,25 +455,29 @@ def get_method_config_class(spec_config: "SpeculativeConfig") -> type[Speculator
     if method not in _CONFIG_BY_METHOD:
         raise ValueError(f"Unsupported speculative method: '{method}'")
     config_cls = resolve_obj_by_qualname(_CONFIG_BY_METHOD[method])
-    target_configs = _CONFIG_BY_TARGET_MODEL_TYPE.get(method)
-    if target_configs is None:
+    target_config_cls = _get_target_config_class(spec_config, method)
+    if target_config_cls is None:
         return config_cls
+    if not (
+        isinstance(target_config_cls, type)
+        and issubclass(target_config_cls, SpeculatorConfig)
+        and issubclass(target_config_cls, config_cls)
+        and target_config_cls.base_method == method
+    ):
+        raise TypeError(
+            f"Target config {target_config_cls!r} must specialize method {method!r}"
+        )
+    return target_config_cls
+
+
+def _get_target_config_class(spec_config: "SpeculativeConfig", method: str) -> Any:
+    """The target family's config for `method`, if it has one."""
+    target_configs = _CONFIG_BY_TARGET_MODEL_TYPE.get(method)
     target = spec_config.target_model_config
-    if target is not None:
-        model_type = target.hf_text_config.model_type
-        if qualname := target_configs.get(model_type):
-            target_config_cls = resolve_obj_by_qualname(qualname)
-            if not (
-                isinstance(target_config_cls, type)
-                and issubclass(target_config_cls, SpeculatorConfig)
-                and issubclass(target_config_cls, config_cls)
-                and target_config_cls.base_method == method
-            ):
-                raise TypeError(
-                    f"Target config {qualname!r} must specialize method {method!r}"
-                )
-            return target_config_cls
-    return config_cls
+    if target_configs is None or target is None:
+        return None
+    qualname = target_configs.get(target.hf_text_config.model_type)
+    return None if qualname is None else resolve_obj_by_qualname(qualname)
 
 
 def get_speculator_config_class(
@@ -521,6 +535,11 @@ def _resolve_checkpoint_config_class(
 
     if declared_cls is not None:
         assert issubclass(declared_cls, DraftModelSpeculatorConfig)
+        # Detected from the draft: the target family may specialize it.
+        assert declared_cls.base_method is not None
+        target_cls = _get_target_config_class(spec_config, declared_cls.base_method)
+        if isinstance(target_cls, type) and issubclass(target_cls, declared_cls):
+            return target_cls
         return declared_cls
     for method in _CHECKPOINT_DETECTION_ORDER:
         config_cls = resolve_obj_by_qualname(_CONFIG_BY_METHOD[method])

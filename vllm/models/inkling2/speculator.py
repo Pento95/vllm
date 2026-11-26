@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""DSpark speculator for the Inkling2 draft: stores the raw target features
-(each draft layer mixes them itself) and runs its recurrent Markov head."""
+"""Inkling2 speculators: DSpark, whose draft stores the raw target features
+(each draft layer mixes them itself) and runs its recurrent Markov head, and
+DFlash2, which needs the target's normalized input embeddings."""
 
 import torch
 import torch.nn as nn
 
 from vllm.config import VllmConfig
+from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import DFlash2Speculator
 from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
 from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
 
@@ -75,3 +77,15 @@ class Inkling2DSparkSpeculator(DSparkSpeculator):
                 logits = self.model.markov_logits(base_logits[:, i], bias)
                 prev = self._sample_logits(logits, idx_map[:, i], sample_pos[:, i], i)
             self.draft_tokens[:num_reqs, i] = prev
+
+
+class Inkling2DFlash2Speculator(DFlash2Speculator):
+    _speculator_name = "Inkling2 DFlash2"
+
+    def load_draft_model(
+        self, target_model: nn.Module, target_attn_layer_names: set[str]
+    ) -> nn.Module:
+        model = super().load_draft_model(target_model, target_attn_layer_names)
+        # The draft shares the target's embed_tokens; Inkling2 normalizes them.
+        model.model.embed_norm = target_model.get_language_model().model.embed_norm
+        return model

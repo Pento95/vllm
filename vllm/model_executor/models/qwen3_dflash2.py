@@ -474,9 +474,13 @@ class CandidateSelector(nn.Module):
         top_k: int,
         params_dtype: torch.dtype,
         prefix: str,
+        post_softcap: float | None = None,
     ) -> None:
         super().__init__()
         self.top_k = top_k
+        # Soft cap on the summed unary and edge scores (selector_softcap_mode
+        # "after_correction"); None when the cap is on the unary logits alone.
+        self.post_softcap = post_softcap
         self.predecessor_codebook = nn.Parameter(
             torch.empty(vocab_size, rank, dtype=params_dtype), requires_grad=False
         )
@@ -501,7 +505,7 @@ class CandidateSelector(nn.Module):
         anchor_token_ids: torch.Tensor,
     ) -> torch.Tensor:
         hidden = self.hidden_projection(hidden_states)
-        return _score_edges(
+        scores = _score_edges(
             self.predecessor_codebook,
             self.successor_codebook,
             candidate_ids,
@@ -510,6 +514,9 @@ class CandidateSelector(nn.Module):
             anchor_token_ids,
             self.top_k,
         )
+        if self.post_softcap is not None:
+            scores = torch.tanh(scores / self.post_softcap) * self.post_softcap
+        return scores
 
 
 class DFlash2Qwen3Model(DFlashQwen3Model):
@@ -531,6 +538,14 @@ class DFlash2Qwen3Model(DFlashQwen3Model):
         self.input_embedding_scale = float(
             draft_config.get("input_embedding_scale", 1.0)
         )
+        mode = draft_config.get("selector_softcap_mode", "before_correction")
+        if mode not in ("before_correction", "after_correction"):
+            raise ValueError(
+                f"Unknown DFlash2 selector_softcap_mode {mode!r}; expected "
+                "'before_correction' or 'after_correction'."
+            )
+        softcap = float(draft_config.get("final_logit_softcapping") or 0.0)
+        softcap = softcap if softcap > 0 else None
         # Without its own tag the selector shares the draft head's compile cache.
         with set_model_tag("dflash2_candidate_selector"):
             self.candidate_selector = CandidateSelector(
@@ -540,6 +555,7 @@ class DFlash2Qwen3Model(DFlashQwen3Model):
                 top_k=int(draft_config["selector_top_k"]),
                 params_dtype=vllm_config.model_config.dtype,
                 prefix=maybe_prefix(prefix, "candidate_selector"),
+                post_softcap=softcap if mode == "after_correction" else None,
             )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -556,12 +572,17 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         draft_config = self.config.dflash_config
         softcap = float(draft_config.get("final_logit_softcapping") or 0.0)
+        softcap = softcap if softcap > 0 else None
+        # The cap goes on the unary logits or, if the selector caps its summed
+        # scores, nowhere here (the cap is monotonic: the same top-k).
+        if self.model.candidate_selector.post_softcap is not None:
+            softcap = None
         # Candidates index the selector codebooks, which have the draft's
         # vocabulary; the target's vocabulary can be larger.
         self.candidate_logits_processor = LogitsProcessor(
             min(vllm_config.model_config.get_vocab_size(), self.config.vocab_size),
             scale=float(draft_config.get("output_multiplier", 1.0)),
-            soft_cap=softcap if softcap > 0 else None,
+            soft_cap=softcap,
         )
 
     def compute_candidates(
